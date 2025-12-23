@@ -26,6 +26,9 @@ class TMW_SEO_CSV_Autopilot {
     add_action('admin_post_tmwseo_csv_run_now', [__CLASS__, 'handle_run_now']);
     add_action('admin_post_tmwseo_csv_reset_progress', [__CLASS__, 'handle_reset_progress']);
     add_action('admin_post_tmwseo_csv_test_lookup', [__CLASS__, 'handle_test_lookup']);
+    add_action('admin_post_tmwseo_csv_backfill_model_ids', [__CLASS__, 'handle_backfill_model_ids']);
+    add_action('admin_post_tmwseo_csv_backfill_video_page_ids', [__CLASS__, 'handle_backfill_video_page_ids']);
+    add_action('admin_post_tmwseo_csv_backfill_video_ids', [__CLASS__, 'handle_backfill_video_ids']);
 
     add_action(self::CRON_HOOK, [__CLASS__, 'run_batch']);
 
@@ -207,6 +210,13 @@ class TMW_SEO_CSV_Autopilot {
 
     echo '<p><strong>Workflow:</strong> 1) Paste hard-block regex 2) Upload CSVs 3) Import to DB 4) Start Batch Apply</p>';
 
+    if (isset($_GET['tmwseo_backfill_notice'])) {
+      $notice = sanitize_text_field(wp_unslash($_GET['tmwseo_backfill_notice']));
+      if ($notice !== '') {
+        echo '<div class="notice notice-success"><p>' . esc_html($notice) . '</p></div>';
+      }
+    }
+
     // SETTINGS FORM
     echo '<h2>Settings</h2>';
     echo '<form method="post" action="'.esc_url(admin_url('admin-post.php')).'">';
@@ -301,6 +311,28 @@ class TMW_SEO_CSV_Autopilot {
 
     echo '<p class="description">Batch runs via WP-Cron every ~2 minutes while running.</p>';
 
+    // BACKFILL TOOLS
+    echo '<hr/><h2>Backfill ID Tools</h2>';
+    echo '<p>Use these tools to backfill missing mapping meta values without overwriting existing ones.</p>';
+
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="display:inline-block;margin-right:10px;">';
+    echo '<input type="hidden" name="action" value="tmwseo_csv_backfill_model_ids" />';
+    wp_nonce_field('tmwseo_csv_backfill_model_ids');
+    submit_button('Backfill Model page IDs', 'secondary', 'submit', false);
+    echo '</form>';
+
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="display:inline-block;margin-right:10px;">';
+    echo '<input type="hidden" name="action" value="tmwseo_csv_backfill_video_page_ids" />';
+    wp_nonce_field('tmwseo_csv_backfill_video_page_ids');
+    submit_button('Backfill Video-page IDs', 'secondary', 'submit', false);
+    echo '</form>';
+
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="display:inline-block;">';
+    echo '<input type="hidden" name="action" value="tmwseo_csv_backfill_video_ids" />';
+    wp_nonce_field('tmwseo_csv_backfill_video_ids');
+    submit_button('Backfill Video IDs (Titles)', 'secondary', 'submit', false);
+    echo '</form>';
+
     // DIAGNOSTICS
     $model_h2_source = ($s['model_h2_source'] === 'trait') ? 'model_trait' : 'model_nt';
     $model_h2_table = self::get_model_h2_table_name($model_h2_source);
@@ -384,6 +416,99 @@ class TMW_SEO_CSV_Autopilot {
       $url = add_query_arg(['lookup_post_id' => $post_id, 'tmwseo_csv_lookup_nonce' => wp_create_nonce('tmwseo_csv_diag_lookup')], $url);
     }
 
+    wp_redirect($url);
+    exit;
+  }
+
+  public static function handle_backfill_model_ids() {
+    if (!current_user_can('manage_options')) wp_die('No permission');
+    check_admin_referer('tmwseo_csv_backfill_model_ids');
+
+    $s = self::get_settings();
+    $meta_key = $s['page_id_meta_key'];
+    $post_types = self::csv_list($s['model_post_types']);
+    $source = ($s['model_h2_source'] === 'trait') ? 'model_trait' : 'model_nt';
+    $table = self::get_model_h2_table_name($source);
+
+    if (!$meta_key || empty($post_types) || !$table) {
+      return self::redirect_backfill('Backfill Model page IDs skipped: missing meta key, post types, or source table.');
+    }
+
+    $page_ids = self::fetch_ordered_page_ids($table);
+    $posts = self::fetch_all_post_ids($post_types);
+    $result = self::assign_ids_to_posts($page_ids, $posts, $meta_key);
+
+    $msg = sprintf(
+      'Backfill Model page IDs: assigned %d (source rows=%d, posts=%d).',
+      $result['assigned'],
+      count($page_ids),
+      count($posts)
+    );
+    self::log('[TMW-BATCH] ' . $msg);
+    return self::redirect_backfill($msg);
+  }
+
+  public static function handle_backfill_video_page_ids() {
+    if (!current_user_can('manage_options')) wp_die('No permission');
+    check_admin_referer('tmwseo_csv_backfill_video_page_ids');
+
+    $s = self::get_settings();
+    $meta_key = $s['page_id_meta_key'];
+    $post_types = self::csv_list($s['video_h2_post_types']);
+    $table = self::table('tmwseo_video_h2');
+
+    if (!$meta_key || empty($post_types)) {
+      return self::redirect_backfill('Backfill Video-page IDs skipped: missing meta key or post types.');
+    }
+
+    $page_ids = self::fetch_ordered_page_ids($table);
+    $posts = self::fetch_all_post_ids($post_types);
+    $result = self::assign_ids_to_posts($page_ids, $posts, $meta_key);
+
+    $msg = sprintf(
+      'Backfill Video-page IDs: assigned %d (source rows=%d, posts=%d).',
+      $result['assigned'],
+      count($page_ids),
+      count($posts)
+    );
+    self::log('[TMW-BATCH] ' . $msg);
+    return self::redirect_backfill($msg);
+  }
+
+  public static function handle_backfill_video_ids() {
+    if (!current_user_can('manage_options')) wp_die('No permission');
+    check_admin_referer('tmwseo_csv_backfill_video_ids');
+
+    $s = self::get_settings();
+    $meta_key = $s['video_id_meta_key'];
+    $post_types = self::csv_list($s['titles_post_types']);
+    $video_ids = self::fetch_distinct_video_ids();
+    $posts = self::fetch_all_post_ids($post_types);
+
+    if (!$meta_key || empty($post_types)) {
+      return self::redirect_backfill('Backfill Video IDs skipped: missing meta key or post types.');
+    }
+
+    $result = self::assign_ids_to_posts($video_ids, $posts, $meta_key);
+
+    $msg = sprintf(
+      'Backfill Video IDs (Titles): assigned %d (source rows=%d, posts=%d).',
+      $result['assigned'],
+      count($video_ids),
+      count($posts)
+    );
+    self::log('[TMW-BATCH] ' . $msg);
+    return self::redirect_backfill($msg);
+  }
+
+  private static function redirect_backfill($message) {
+    $url = add_query_arg(
+      [
+        'page' => 'tmwseo-csv',
+        'tmwseo_backfill_notice' => (string)$message,
+      ],
+      admin_url('admin.php')
+    );
     wp_redirect($url);
     exit;
   }
@@ -845,6 +970,42 @@ class TMW_SEO_CSV_Autopilot {
     return array_map('intval', $ids);
   }
 
+  private static function fetch_all_post_ids($post_types) {
+    global $wpdb;
+    if (empty($post_types)) return [];
+
+    $post_types = array_filter(array_map('sanitize_key', $post_types));
+    if (empty($post_types)) return [];
+
+    $placeholders = implode(',', array_fill(0, count($post_types), '%s'));
+    $sql = $wpdb->prepare(
+      "SELECT ID FROM {$wpdb->posts} WHERE post_status='publish' AND post_type IN ($placeholders) ORDER BY ID ASC",
+      $post_types
+    );
+
+    $ids = $wpdb->get_col($sql);
+    if (!is_array($ids)) return [];
+    return array_map('intval', $ids);
+  }
+
+  private static function fetch_ordered_page_ids($table) {
+    global $wpdb;
+    if (!$table) return [];
+    $sql = "SELECT page_id FROM {$table} ORDER BY page_id ASC";
+    $rows = $wpdb->get_col($sql);
+    if (!is_array($rows)) return [];
+    return array_values(array_map('strval', $rows));
+  }
+
+  private static function fetch_distinct_video_ids() {
+    global $wpdb;
+    $table = self::table('tmwseo_titles');
+    $sql = "SELECT DISTINCT video_id FROM {$table} ORDER BY video_id ASC";
+    $rows = $wpdb->get_col($sql);
+    if (!is_array($rows)) return [];
+    return array_values(array_map('strval', $rows));
+  }
+
   /** -------------------------
    * Data lookups
    * ------------------------ */
@@ -1041,6 +1202,24 @@ class TMW_SEO_CSV_Autopilot {
       'page_id' => $page_id,
       'has_csv' => $has_csv,
     ];
+  }
+
+  private static function assign_ids_to_posts($ids, $post_ids, $meta_key) {
+    $assigned = 0;
+    $index = 0;
+    $total = count($ids);
+
+    foreach ($post_ids as $pid) {
+      if ($index >= $total) break;
+      if (metadata_exists('post', $pid, $meta_key)) continue;
+      $value = $ids[$index] ?? '';
+      if ($value === '') continue;
+      update_post_meta($pid, $meta_key, $value);
+      $assigned++;
+      $index++;
+    }
+
+    return ['assigned' => $assigned];
   }
 
   /** -------------------------
