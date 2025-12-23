@@ -25,6 +25,7 @@ class TMW_SEO_CSV_Autopilot {
     add_action('admin_post_tmwseo_csv_start_batch', [__CLASS__, 'handle_start_batch']);
     add_action('admin_post_tmwseo_csv_run_now', [__CLASS__, 'handle_run_now']);
     add_action('admin_post_tmwseo_csv_reset_progress', [__CLASS__, 'handle_reset_progress']);
+    add_action('admin_post_tmwseo_csv_test_lookup', [__CLASS__, 'handle_test_lookup']);
 
     add_action(self::CRON_HOOK, [__CLASS__, 'run_batch']);
 
@@ -300,6 +301,64 @@ class TMW_SEO_CSV_Autopilot {
 
     echo '<p class="description">Batch runs via WP-Cron every ~2 minutes while running.</p>';
 
+    // DIAGNOSTICS
+    $model_h2_source = ($s['model_h2_source'] === 'trait') ? 'model_trait' : 'model_nt';
+    $model_h2_table = self::get_model_h2_table_name($model_h2_source);
+    $sample_page_ids = self::get_model_h2_samples($model_h2_source);
+    $sample_model_posts = self::get_model_posts_sample($s['model_post_types'], $model_h2_source);
+    $lookup_result = self::get_lookup_result($model_h2_source);
+
+    echo '<hr/><h2>Diagnostics</h2>';
+
+    echo '<h3>Mapping configuration</h3>';
+    echo '<ul>';
+    echo '<li>Mapping mode: <strong>' . esc_html($s['mapping_mode']) . '</strong></li>';
+    echo '<li>Video ID meta key: <code>' . esc_html($s['video_id_meta_key']) . '</code></li>';
+    echo '<li>Page ID meta key: <code>' . esc_html($s['page_id_meta_key']) . '</code></li>';
+    echo '<li>Model H2 source: <strong>' . esc_html($model_h2_source) . '</strong> (table: <code>' . esc_html($model_h2_table ?: 'N/A') . '</code>)</li>';
+    echo '</ul>';
+
+    echo '<h3>Sample model H2 page_ids (from current source)</h3>';
+    if (!empty($sample_page_ids)) {
+      echo '<p><code>' . esc_html(implode(', ', $sample_page_ids)) . '</code></p>';
+    } else {
+      echo '<p><em>No page_ids found in the selected model H2 table.</em></p>';
+    }
+
+    echo '<h3>Sample model posts</h3>';
+    if (!empty($sample_model_posts)) {
+      echo '<table class="widefat striped" style="max-width:920px;">';
+      echo '<thead><tr><th>post_id</th><th>post_name (slug)</th><th>extracted page_id</th><th>CSV row?</th></tr></thead><tbody>';
+      foreach ($sample_model_posts as $row) {
+        $has_csv = $row['has_csv'] ? 'Yes' : 'No';
+        echo '<tr>';
+        echo '<td>' . esc_html($row['post_id']) . '</td>';
+        echo '<td>' . esc_html($row['post_name']) . '</td>';
+        echo '<td>' . esc_html($row['page_id']) . '</td>';
+        echo '<td>' . esc_html($has_csv) . '</td>';
+        echo '</tr>';
+      }
+      echo '</tbody></table>';
+    } else {
+      echo '<p><em>No sample posts found for configured model post types.</em></p>';
+    }
+
+    echo '<h3>Test lookup</h3>';
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="max-width:520px;">';
+    echo '<input type="hidden" name="action" value="tmwseo_csv_test_lookup" />';
+    wp_nonce_field('tmwseo_csv_test_lookup');
+    echo '<p><label for="tmwseo_lookup_post_id">Post ID:</label> <input type="number" name="lookup_post_id" id="tmwseo_lookup_post_id" min="1" class="small-text" /></p>';
+    submit_button('Test lookup', 'secondary', 'submit', false);
+    echo '</form>';
+
+    if ($lookup_result !== null) {
+      if (isset($lookup_result['error'])) {
+        echo '<p style="color:#a00;"><strong>Error:</strong> ' . esc_html($lookup_result['error']) . '</p>';
+      } else {
+        echo '<p><strong>Lookup result:</strong> Post ' . esc_html($lookup_result['post_id']) . ' → page_id <code>' . esc_html($lookup_result['page_id']) . '</code> | CSV row: <strong>' . esc_html($lookup_result['has_csv'] ? 'Yes' : 'No') . '</strong></p>';
+      }
+    }
+
     // LOGS
     echo '<hr/><h2>Logs (latest first)</h2>';
     echo '<div style="background:#111;color:#0f0;padding:12px;border-radius:8px;max-height:340px;overflow:auto;font-family:monospace;font-size:12px;">';
@@ -312,6 +371,21 @@ class TMW_SEO_CSV_Autopilot {
     echo '<p>Video sitemap URL: <code>'.esc_html(home_url('/tmwseo-video-sitemap.xml')).'</code></p>';
 
     echo '</div>';
+  }
+
+  public static function handle_test_lookup() {
+    if (!current_user_can('manage_options')) wp_die('No permission');
+    check_admin_referer('tmwseo_csv_test_lookup');
+
+    $post_id = isset($_POST['lookup_post_id']) ? absint($_POST['lookup_post_id']) : 0;
+
+    $url = add_query_arg([ 'page' => 'tmwseo-csv' ], admin_url('admin.php'));
+    if ($post_id > 0) {
+      $url = add_query_arg(['lookup_post_id' => $post_id, 'tmwseo_csv_lookup_nonce' => wp_create_nonce('tmwseo_csv_diag_lookup')], $url);
+    }
+
+    wp_redirect($url);
+    exit;
   }
 
   public static function handle_save_settings() {
@@ -896,6 +970,77 @@ class TMW_SEO_CSV_Autopilot {
     }
 
     return self::clean_id($id);
+  }
+
+  private static function get_model_h2_table_name($source) {
+    if ($source === 'model_trait') return self::table('tmwseo_model_h2');
+    if ($source === 'model_nt') return self::table('tmwseo_model_h2_nt');
+    return '';
+  }
+
+  private static function get_model_h2_samples($source) {
+    global $wpdb;
+    $table = self::get_model_h2_table_name($source);
+    if (!$table) return [];
+    $sql = "SELECT page_id FROM {$table} ORDER BY page_id ASC LIMIT 10";
+    $rows = $wpdb->get_col($sql);
+    if (!is_array($rows)) return [];
+    return array_map('strval', $rows);
+  }
+
+  private static function model_h2_row_exists($page_id, $source) {
+    if (!$page_id) return false;
+    $row = self::get_h2_for_page($page_id, $source);
+    return !empty($row);
+  }
+
+  private static function get_model_posts_sample($post_types, $source) {
+    $types = self::csv_list($post_types);
+    if (empty($types)) return [];
+
+    $posts = get_posts([
+      'post_type' => $types,
+      'post_status' => 'publish',
+      'posts_per_page' => 10,
+      'orderby' => 'ID',
+      'order' => 'DESC',
+      'fields' => 'ids',
+      'suppress_filters' => true,
+      'no_found_rows' => true,
+    ]);
+
+    if (!is_array($posts) || empty($posts)) return [];
+
+    $rows = [];
+    foreach ($posts as $pid) {
+      $page_id = self::resolve_id_for_post($pid, 'page');
+      $rows[] = [
+        'post_id' => intval($pid),
+        'post_name' => (string)get_post_field('post_name', $pid),
+        'page_id' => $page_id,
+        'has_csv' => self::model_h2_row_exists($page_id, $source),
+      ];
+    }
+    return $rows;
+  }
+
+  private static function get_lookup_result($source) {
+    $post_id = isset($_GET['lookup_post_id']) ? absint($_GET['lookup_post_id']) : 0;
+    if ($post_id <= 0) return null;
+
+    $nonce = $_GET['tmwseo_csv_lookup_nonce'] ?? '';
+    if (!wp_verify_nonce($nonce, 'tmwseo_csv_diag_lookup')) {
+      return ['error' => 'Invalid lookup nonce. Please try again.'];
+    }
+
+    $page_id = self::resolve_id_for_post($post_id, 'page');
+    $has_csv = self::model_h2_row_exists($page_id, $source);
+
+    return [
+      'post_id' => $post_id,
+      'page_id' => $page_id,
+      'has_csv' => $has_csv,
+    ];
   }
 
   /** -------------------------
