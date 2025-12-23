@@ -10,10 +10,13 @@ Author: TMW
 if (!defined('ABSPATH')) { exit; }
 
 class TMW_SEO_CSV_Autopilot {
+  private static $fulltext_cache = [];
+  private static $assigned_cache = [];
 
   const OPT_SETTINGS = 'tmwseo_csv_settings_v1';
   const OPT_LOGS     = 'tmwseo_csv_logs_v1';
   const OPT_FT_READY = 'tmwseo_csv_ft_ready_v1';
+  const OPT_ASSIGNED = 'tmwseo_csv_assigned_ids_v1';
   const CRON_HOOK    = 'tmwseo_csv_batch_cron_v1';
 
   public static function boot() {
@@ -69,6 +72,7 @@ class TMW_SEO_CSV_Autopilot {
 
   private static function ensure_fulltext_indexes() {
     global $wpdb;
+    $all_ok = true;
     $tables = [
       self::table('tmwseo_titles') => [
         'name' => 'tmwseo_ft_titles',
@@ -89,25 +93,66 @@ class TMW_SEO_CSV_Autopilot {
     ];
 
     foreach ($tables as $table => $meta) {
-      $exists = $wpdb->get_var($wpdb->prepare(
-        "SELECT COUNT(1) FROM INFORMATION_SCHEMA.STATISTICS WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s",
-        $table,
-        $meta['name']
-      ));
-
-      if (intval($exists) > 0) continue;
+      $exists = self::fulltext_index_exists($table, $meta['name']);
+      if ($exists) continue;
 
       $cols = implode(',', array_map(function($c){ return "`$c`"; }, $meta['cols']));
       $sql = "ALTER TABLE {$table} ADD FULLTEXT {$meta['name']} ({$cols})";
       $res = $wpdb->query($sql);
       if ($res === false) {
-        self::log('[TMW-MAP] Failed to add FULLTEXT index on ' . $table);
+        $all_ok = false;
+        $error = $wpdb->last_error;
+        $ddl = self::get_table_ddl_summary($table);
+        self::log('[TMW-FT] Failed to add FULLTEXT index on ' . $table . ' (' . $meta['name'] . '): ' . ($error ?: 'unknown error') . ' | ' . $ddl);
       } else {
-        self::log('[TMW-MAP] Added FULLTEXT index on ' . $table);
+        self::log('[TMW-FT] Added FULLTEXT index on ' . $table);
       }
     }
 
-    update_option(self::OPT_FT_READY, '1', false);
+    update_option(self::OPT_FT_READY, $all_ok ? '1' : 'error', false);
+  }
+
+  private static function fulltext_index_exists($table, $index) {
+    global $wpdb;
+    $safe_table = esc_sql($table);
+    $existing = $wpdb->get_results($wpdb->prepare(
+      "SHOW INDEX FROM `{$safe_table}` WHERE Key_name = %s",
+      $index
+    ), ARRAY_A);
+    if (!empty($existing)) {
+      self::log('[TMW-FT] FULLTEXT index already exists on ' . $table . ' (' . $index . ')');
+      return true;
+    }
+    return false;
+  }
+
+  private static function is_fulltext_available($table, $index) {
+    if (isset(self::$fulltext_cache[$table][$index])) {
+      return self::$fulltext_cache[$table][$index];
+    }
+
+    global $wpdb;
+    $safe_table = esc_sql($table);
+    $rows = $wpdb->get_results($wpdb->prepare(
+      "SHOW INDEX FROM `{$safe_table}` WHERE Key_name = %s AND Index_type = 'FULLTEXT'",
+      $index
+    ), ARRAY_A);
+    $ok = !empty($rows);
+    if (!isset(self::$fulltext_cache[$table])) self::$fulltext_cache[$table] = [];
+    self::$fulltext_cache[$table][$index] = $ok;
+    return $ok;
+  }
+
+  private static function get_table_ddl_summary($table) {
+    global $wpdb;
+    $safe_table = esc_sql($table);
+    $engine = $wpdb->get_var($wpdb->prepare(
+      "SELECT ENGINE FROM information_schema.TABLES WHERE table_schema = DATABASE() AND table_name = %s",
+      $table
+    ));
+    $create = $wpdb->get_row("SHOW CREATE TABLE `{$safe_table}`", ARRAY_A);
+    $ddl = isset($create['Create Table']) ? substr($create['Create Table'], 0, 400) : 'N/A';
+    return 'ENGINE=' . ($engine ?: 'unknown') . '; DDL=' . $ddl;
   }
 
   private static function create_tables() {
@@ -210,6 +255,8 @@ class TMW_SEO_CSV_Autopilot {
       // RankMath + writing
       'update_wp_title' => '0',
       'write_rankmath'  => '1',
+      'auto_backfill_missing' => '1',
+      'smart_confidence' => 0.35,
 
       // Adult SEO
       'adult_meta_post_types' => 'video,model,video_page',
@@ -303,6 +350,8 @@ class TMW_SEO_CSV_Autopilot {
 
     echo '<tr><th>Write RankMath meta</th><td><label><input type="checkbox" name="write_rankmath" value="1" '.checked($s['write_rankmath'], '1', false).' /> Enabled</label></td></tr>';
     echo '<tr><th>Update WP post title</th><td><label><input type="checkbox" name="update_wp_title" value="1" '.checked($s['update_wp_title'], '1', false).' /> Also set WordPress post title = SEO title</label></td></tr>';
+    echo '<tr><th>Auto backfill missing IDs</th><td><label><input type="checkbox" name="auto_backfill_missing" value="1" '.checked($s['auto_backfill_missing'], '1', false).' /> Use Smart Backfill when mapping meta/slug is missing</label></td></tr>';
+    echo '<tr><th>Smart backfill confidence</th><td><input type="number" step="0.01" min="0" max="1" name="smart_confidence" value="'.esc_attr($s['smart_confidence']).'" class="small-text" /> <p class="description">Minimum score (0-1) required to auto-assign an ID. Lower = more aggressive.</p></td></tr>';
 
     echo '<tr><th>Adult meta post types</th><td><input type="text" name="adult_meta_post_types" value="'.esc_attr($s['adult_meta_post_types']).'" class="regular-text" /> <p class="description">Comma-separated. Adds: <code>&lt;meta name="rating" content="adult"&gt;</code></p></td></tr>';
     echo '<tr><th>Video schema post types</th><td><input type="text" name="output_video_schema_post_types" value="'.esc_attr($s['output_video_schema_post_types']).'" class="regular-text" /></td></tr>';
@@ -418,6 +467,7 @@ class TMW_SEO_CSV_Autopilot {
     $model_h2_table = self::get_model_h2_table_name($model_h2_source);
     $sample_page_ids = self::get_model_h2_samples($model_h2_source);
     $sample_model_posts = self::get_model_posts_sample($s['model_post_types'], $model_h2_source);
+    $lookup_target = isset($_GET['lookup_target']) ? sanitize_text_field($_GET['lookup_target']) : 'page_model';
     $lookup_result = self::get_lookup_result($model_h2_source);
 
     echo '<hr/><h2>Diagnostics</h2>';
@@ -440,7 +490,7 @@ class TMW_SEO_CSV_Autopilot {
     echo '<h3>Sample model posts</h3>';
     if (!empty($sample_model_posts)) {
       echo '<table class="widefat striped" style="max-width:920px;">';
-      echo '<thead><tr><th>post_id</th><th>post_name (slug)</th><th>extracted page_id</th><th>CSV row?</th></tr></thead><tbody>';
+      echo '<thead><tr><th>post_id</th><th>post_name (slug)</th><th>extracted page_id</th><th>CSV row?</th><th>trace</th></tr></thead><tbody>';
       foreach ($sample_model_posts as $row) {
         $has_csv = $row['has_csv'] ? 'Yes' : 'No';
         echo '<tr>';
@@ -448,6 +498,15 @@ class TMW_SEO_CSV_Autopilot {
         echo '<td>' . esc_html($row['post_name']) . '</td>';
         echo '<td>' . esc_html($row['page_id']) . '</td>';
         echo '<td>' . esc_html($has_csv) . '</td>';
+        $trace = trim($row['trace']);
+        if ($row['score'] > 0) {
+          $trace .= ' score=' . number_format($row['score'], 2);
+        }
+        if (!empty($row['search_text'])) {
+          $snippet = function_exists('mb_substr') ? mb_substr($row['search_text'], 0, 60) : substr($row['search_text'], 0, 60);
+          $trace .= ' search="' . esc_html($snippet) . '"';
+        }
+        echo '<td>' . esc_html($trace) . '</td>';
         echo '</tr>';
       }
       echo '</tbody></table>';
@@ -460,6 +519,12 @@ class TMW_SEO_CSV_Autopilot {
     echo '<input type="hidden" name="action" value="tmwseo_csv_test_lookup" />';
     wp_nonce_field('tmwseo_csv_test_lookup');
     echo '<p><label for="tmwseo_lookup_post_id">Post ID:</label> <input type="number" name="lookup_post_id" id="tmwseo_lookup_post_id" min="1" class="small-text" /></p>';
+    echo '<p><label for="tmwseo_lookup_target">Target:</label> ';
+    echo '<select name="lookup_target" id="tmwseo_lookup_target">';
+    echo '<option value="page_model" '.selected($lookup_target, 'page_model', false).'>Model H2</option>';
+    echo '<option value="page_video" '.selected($lookup_target, 'page_video', false).'>Video Page H2</option>';
+    echo '<option value="video" '.selected($lookup_target, 'video', false).'>Video Titles</option>';
+    echo '</select></p>';
     submit_button('Test lookup', 'secondary', 'submit', false);
     echo '</form>';
 
@@ -467,7 +532,37 @@ class TMW_SEO_CSV_Autopilot {
       if (isset($lookup_result['error'])) {
         echo '<p style="color:#a00;"><strong>Error:</strong> ' . esc_html($lookup_result['error']) . '</p>';
       } else {
-        echo '<p><strong>Lookup result:</strong> Post ' . esc_html($lookup_result['post_id']) . ' → page_id <code>' . esc_html($lookup_result['page_id']) . '</code> | CSV row: <strong>' . esc_html($lookup_result['has_csv'] ? 'Yes' : 'No') . '</strong></p>';
+        $method = $lookup_result['used_fulltext'] ? 'FULLTEXT' : 'PHP fallback';
+        echo '<div style="background:#f9f9f9;padding:10px;border:1px solid #ddd;">';
+        echo '<p><strong>Lookup result:</strong> Post ' . esc_html($lookup_result['post_id']) . ' (' . esc_html($lookup_result['target']) . ') → ID <code>' . esc_html($lookup_result['id'] ?: '[none]') . '</code> | CSV row: <strong>' . esc_html($lookup_result['has_csv'] ? 'Yes' : 'No') . '</strong> | Method: ' . esc_html($method) . ' | Score: ' . number_format(floatval($lookup_result['score']), 2) . '</p>';
+        if (!empty($lookup_result['search_text'])) {
+          echo '<p><strong>Search text:</strong> <code>' . esc_html($lookup_result['search_text']) . '</code></p>';
+        }
+        if (!empty($lookup_result['trace'])) {
+          echo '<p><strong>Trace:</strong> ' . esc_html(implode(' → ', $lookup_result['trace'])) . '</p>';
+        }
+        if (!empty($lookup_result['candidates'])) {
+          echo '<table class="widefat striped" style="max-width:760px;">';
+          echo '<thead><tr><th>#</th><th>ID</th><th>Score</th><th>Preview</th></tr></thead><tbody>';
+          $idx = 1;
+          foreach ($lookup_result['candidates'] as $cand) {
+            $preview = isset($cand['text']) ? $cand['text'] : '';
+            if (function_exists('mb_substr')) {
+              $preview = mb_substr($preview, 0, 140);
+            } else {
+              $preview = substr($preview, 0, 140);
+            }
+            echo '<tr>';
+            echo '<td>' . esc_html($idx) . '</td>';
+            echo '<td>' . esc_html($cand['id'] ?? '') . '</td>';
+            echo '<td>' . esc_html(number_format(floatval($cand['score'] ?? 0), 2)) . '</td>';
+            echo '<td><code>' . esc_html($preview) . '</code></td>';
+            echo '</tr>';
+            $idx++;
+          }
+          echo '</tbody></table>';
+        }
+        echo '</div>';
       }
     }
 
@@ -490,10 +585,15 @@ class TMW_SEO_CSV_Autopilot {
     check_admin_referer('tmwseo_csv_test_lookup');
 
     $post_id = isset($_POST['lookup_post_id']) ? absint($_POST['lookup_post_id']) : 0;
+    $target = sanitize_text_field($_POST['lookup_target'] ?? 'page_model');
 
     $url = add_query_arg([ 'page' => 'tmwseo-csv' ], admin_url('admin.php'));
     if ($post_id > 0) {
-      $url = add_query_arg(['lookup_post_id' => $post_id, 'tmwseo_csv_lookup_nonce' => wp_create_nonce('tmwseo_csv_diag_lookup')], $url);
+      $url = add_query_arg([
+        'lookup_post_id' => $post_id,
+        'lookup_target' => $target,
+        'tmwseo_csv_lookup_nonce' => wp_create_nonce('tmwseo_csv_diag_lookup')
+      ], $url);
     }
 
     wp_redirect($url);
@@ -634,6 +734,8 @@ class TMW_SEO_CSV_Autopilot {
 
     $s['write_rankmath'] = isset($_POST['write_rankmath']) ? '1' : '0';
     $s['update_wp_title'] = isset($_POST['update_wp_title']) ? '1' : '0';
+    $s['auto_backfill_missing'] = isset($_POST['auto_backfill_missing']) ? '1' : '0';
+    $s['smart_confidence'] = isset($_POST['smart_confidence']) ? max(0, min(1, floatval($_POST['smart_confidence']))) : $s['smart_confidence'];
 
     $s['adult_meta_post_types'] = sanitize_text_field($_POST['adult_meta_post_types'] ?? $s['adult_meta_post_types']);
     $s['output_video_schema_post_types'] = sanitize_text_field($_POST['output_video_schema_post_types'] ?? $s['output_video_schema_post_types']);
@@ -1221,36 +1323,50 @@ class TMW_SEO_CSV_Autopilot {
   /** -------------------------
    * ID resolution
    * ------------------------ */
-  private static function resolve_id_for_post($post_id, $kind, $source = '') {
+  private static function resolve_id_for_post($post_id, $kind, $source = '', $assign = true) {
+    $res = self::resolve_id_for_post_with_trace($post_id, $kind, $source, $assign, false);
+    return $res['id'];
+  }
+
+  private static function resolve_id_for_post_with_trace($post_id, $kind, $source, $assign, $capture_candidates) {
     $s = self::get_settings();
     $mode = $s['mapping_mode'];
+    $trace = [];
 
     $slug = get_post_field('post_name', $post_id);
-
     $meta_key = ($kind === 'video') ? $s['video_id_meta_key'] : $s['page_id_meta_key'];
     $meta_val = $meta_key ? get_post_meta($post_id, $meta_key, true) : '';
+    $candidate_meta = self::normalize_id_for_kind($meta_val, $kind);
 
-    $candidate = self::normalize_id_for_kind($meta_val, $kind);
-    if ($mode !== 'slug' && $candidate && self::csv_row_exists($candidate, $kind, $source)) {
-      return $candidate;
+    if ($mode !== 'slug' && $candidate_meta && self::csv_row_exists($candidate_meta, $kind, $source)) {
+      return ['id' => $candidate_meta, 'trace' => ['meta_match'], 'search' => null, 'match' => null];
     }
 
+    $matched = null;
     if ($mode === 'meta') {
-      $mapped = self::smart_map_csv_id($post_id, $kind, $source, $meta_key);
-      if ($mapped && !empty($mapped['id'])) {
-        return $mapped['id'];
+      $matched = self::smart_map_csv_id($post_id, $kind, $source, $meta_key, $assign, $capture_candidates);
+      if ($matched && !empty($matched['id'])) {
+        return ['id' => $matched['id'], 'trace' => ['smart_meta'], 'search' => $matched, 'match' => $matched];
       }
     }
 
-    $id = ($mode === 'slug') ? $slug : $candidate;
-    $id = $id ? $id : $slug;
-
-    $id = self::normalize_id_for_kind($id, $kind);
-    if ($id && self::csv_row_exists($id, $kind, $source)) {
-      return $id;
+    $fallback_slug = self::normalize_id_for_kind($slug, $kind);
+    if ($mode === 'slug' && $fallback_slug && self::csv_row_exists($fallback_slug, $kind, $source)) {
+      return ['id' => $fallback_slug, 'trace' => ['slug_match'], 'search' => null, 'match' => null];
     }
 
-    return '';
+    if ($s['auto_backfill_missing'] === '1' && !$matched) {
+      $matched = self::smart_map_csv_id($post_id, $kind, $source, $meta_key, $assign, $capture_candidates);
+      if ($matched && !empty($matched['id'])) {
+        return ['id' => $matched['id'], 'trace' => ['smart_auto'], 'search' => $matched, 'match' => $matched];
+      }
+    }
+
+    if ($fallback_slug && self::csv_row_exists($fallback_slug, $kind, $source)) {
+      return ['id' => $fallback_slug, 'trace' => ['slug_fallback'], 'search' => null, 'match' => null];
+    }
+
+    return ['id' => '', 'trace' => ['unmapped'], 'search' => $matched, 'match' => $matched];
   }
 
   private static function get_model_h2_table_name($source) {
@@ -1312,18 +1428,22 @@ class TMW_SEO_CSV_Autopilot {
 
     $rows = [];
     foreach ($posts as $pid) {
-      $page_id = self::resolve_id_for_post($pid, 'page', $source);
+      $resolved = self::resolve_id_for_post_with_trace($pid, 'page', $source, false, false);
+      $page_id = $resolved['id'];
       $rows[] = [
         'post_id' => intval($pid),
         'post_name' => (string)get_post_field('post_name', $pid),
         'page_id' => $page_id,
         'has_csv' => self::model_h2_row_exists($page_id, $source),
+        'trace' => implode(',', $resolved['trace'] ?? []),
+        'score' => isset($resolved['match']['score']) ? floatval($resolved['match']['score']) : 0,
+        'search_text' => isset($resolved['match']['search_text']) ? (string)$resolved['match']['search_text'] : '',
       ];
     }
     return $rows;
   }
 
-  private static function get_lookup_result($source) {
+  private static function get_lookup_result($model_source) {
     $post_id = isset($_GET['lookup_post_id']) ? absint($_GET['lookup_post_id']) : 0;
     if ($post_id <= 0) return null;
 
@@ -1332,13 +1452,38 @@ class TMW_SEO_CSV_Autopilot {
       return ['error' => 'Invalid lookup nonce. Please try again.'];
     }
 
-    $page_id = self::resolve_id_for_post($post_id, 'page', $source);
-    $has_csv = self::model_h2_row_exists($page_id, $source);
+    $target = isset($_GET['lookup_target']) ? sanitize_text_field($_GET['lookup_target']) : 'page_model';
+    $s = self::get_settings();
+
+    if ($target === 'video') {
+      $kind = 'video';
+      $source = 'titles';
+      $meta_key = $s['video_id_meta_key'];
+    } elseif ($target === 'page_video') {
+      $kind = 'page';
+      $source = 'video';
+      $meta_key = $s['page_id_meta_key'];
+    } else { // default model
+      $kind = 'page';
+      $source = $model_source;
+      $meta_key = $s['page_id_meta_key'];
+    }
+
+    $resolved = self::resolve_id_for_post_with_trace($post_id, $kind, $source, false, true);
+    $id = $resolved['id'];
+    $has_csv = $id ? self::csv_row_exists($id, $kind, $source) : false;
+    $match = $resolved['match'] ?? [];
 
     return [
       'post_id' => $post_id,
-      'page_id' => $page_id,
+      'target' => $target,
+      'id' => $id,
       'has_csv' => $has_csv,
+      'search_text' => isset($match['search_text']) ? $match['search_text'] : '',
+      'candidates' => isset($match['candidates']) ? $match['candidates'] : [],
+      'used_fulltext' => isset($match['used_fulltext']) ? $match['used_fulltext'] : false,
+      'score' => isset($match['score']) ? floatval($match['score']) : 0,
+      'trace' => $resolved['trace'] ?? [],
     ];
   }
 
@@ -1360,10 +1505,91 @@ class TMW_SEO_CSV_Autopilot {
     return ['assigned' => $assigned];
   }
 
-  private static function build_search_string($post_id) {
+  private static function get_assigned_ids($meta_key) {
+    if (!$meta_key) return [];
+    if (isset(self::$assigned_cache[$meta_key])) return self::$assigned_cache[$meta_key];
+    $opt = get_option(self::OPT_ASSIGNED, []);
+    $list = [];
+    if (is_array($opt) && isset($opt[$meta_key]) && is_array($opt[$meta_key])) {
+      $list = array_values(array_unique(array_map('strval', $opt[$meta_key])));
+    }
+    self::$assigned_cache[$meta_key] = $list;
+    return $list;
+  }
+
+  private static function mark_assigned_id($meta_key, $id) {
+    if (!$meta_key || !$id) return;
+    $opt = get_option(self::OPT_ASSIGNED, []);
+    if (!is_array($opt)) $opt = [];
+    if (!isset($opt[$meta_key]) || !is_array($opt[$meta_key])) $opt[$meta_key] = [];
+    $opt[$meta_key][] = $id;
+    $opt[$meta_key] = array_values(array_unique(array_map('strval', $opt[$meta_key])));
+    self::$assigned_cache[$meta_key] = $opt[$meta_key];
+    update_option(self::OPT_ASSIGNED, $opt, false);
+  }
+
+  private static function normalize_search_text($text) {
+    $text = strtolower((string)$text);
+    $text = preg_replace('/[^a-z0-9\s]+/', ' ', $text);
+    $text = preg_replace('/\s+/', ' ', trim($text));
+    return $text;
+  }
+
+  private static function tokenize_text($text) {
+    $text = self::normalize_search_text($text);
+    if ($text === '') return [];
+    return array_values(array_filter(explode(' ', $text)));
+  }
+
+  private static function trigram_similarity($a, $b) {
+    $a = '  ' . $a . '  ';
+    $b = '  ' . $b . '  ';
+    $a_len = strlen($a);
+    $b_len = strlen($b);
+    if ($a_len < 3 || $b_len < 3) return 0;
+    $a_grams = [];
+    for ($i = 0; $i < $a_len - 2; $i++) {
+      $a_grams[] = substr($a, $i, 3);
+    }
+    $b_grams = [];
+    for ($i = 0; $i < $b_len - 2; $i++) {
+      $b_grams[] = substr($b, $i, 3);
+    }
+    $a_grams = array_unique($a_grams);
+    $b_grams = array_unique($b_grams);
+    $intersect = count(array_intersect($a_grams, $b_grams));
+    $union = max(1, count($a_grams) + count($b_grams) - $intersect);
+    return $intersect / $union;
+  }
+
+  private static function score_candidate_text($search_tokens, $search_text, $candidate_text) {
+    $candidate_norm = self::normalize_search_text($candidate_text);
+    $candidate_tokens = self::tokenize_text($candidate_norm);
+    if (empty($candidate_tokens)) return 0.0;
+
+    $overlap = 0.0;
+    $unique_search = array_unique($search_tokens);
+    $unique_candidate = array_unique($candidate_tokens);
+    if (!empty($unique_search) && !empty($unique_candidate)) {
+      $shared = count(array_intersect($unique_search, $unique_candidate));
+      $overlap = $shared / max(count($unique_search), count($unique_candidate), 1);
+    }
+
+    $similar_percent = 0;
+    similar_text($search_text, $candidate_norm, $similar_percent);
+    $similar_score = $similar_percent / 100;
+
+    $tri = self::trigram_similarity($search_text, $candidate_norm);
+
+    // Weighted combo
+    return min(1, (0.45 * $overlap) + (0.25 * $tri) + (0.30 * $similar_score));
+  }
+
+  private static function build_search_context($post_id) {
     $title = '';
     $candidates = [
       '_tmw_livejasmin_title',
+      '_tmw_livejasmin_name',
       '_livejasmin_title',
       'livejasmin_title',
     ];
@@ -1390,81 +1616,263 @@ class TMW_SEO_CSV_Autopilot {
       }
     }
 
+    $slug = get_post_field('post_name', $post_id);
+    if ($slug) {
+      $names[] = str_replace(['-', '_'], ' ', $slug);
+    }
+
     $parts = array_filter(array_map('trim', array_merge([$title], $names)));
     $parts = array_values(array_unique($parts));
+    $raw_text = implode(' ', $parts);
+    $search_text = self::normalize_search_text($raw_text);
+    return [
+      'raw_text' => $raw_text,
+      'search_text' => $search_text,
+      'tokens' => self::tokenize_text($search_text),
+    ];
+  }
+
+  private static function get_match_table_meta($kind, $source) {
+    if ($kind === 'video') {
+      return [
+        'table' => self::table('tmwseo_titles'),
+        'id_col' => 'video_id',
+        'text_cols' => ['focus_keyword', 'seo_title', 'tone', 'category', 'source_longtail'],
+        'index' => 'tmwseo_ft_titles',
+      ];
+    }
+
+    if ($source === 'video') {
+      return [
+        'table' => self::table('tmwseo_video_h2'),
+        'id_col' => 'page_id',
+        'text_cols' => ['h2_1', 'h2_2', 'h2_3', 'h2_4'],
+        'index' => 'tmwseo_ft_video_h2',
+      ];
+    }
+
+    if ($source === 'model_trait') {
+      return [
+        'table' => self::table('tmwseo_model_h2'),
+        'id_col' => 'page_id',
+        'text_cols' => ['trait', 'h2_1', 'h2_2', 'h2_3', 'h2_4'],
+        'index' => 'tmwseo_ft_model_h2',
+      ];
+    }
+
+    if ($source === 'model_nt') {
+      return [
+        'table' => self::table('tmwseo_model_h2_nt'),
+        'id_col' => 'page_id',
+        'text_cols' => ['h2_1', 'h2_2', 'h2_3', 'h2_4'],
+        'index' => 'tmwseo_ft_model_h2_nt',
+      ];
+    }
+
+    return null;
+  }
+
+  private static function build_candidate_text($row, $cols) {
+    $parts = [];
+    foreach ($cols as $col) {
+      if (isset($row[$col]) && $row[$col] !== '') {
+        $parts[] = wp_strip_all_tags((string)$row[$col]);
+      }
+    }
+    $parts = array_values(array_filter(array_map('trim', $parts)));
     return implode(' ', $parts);
   }
 
-  private static function smart_map_csv_id($post_id, $kind, $source, $meta_key) {
-    if (!$meta_key) return null;
-    $search = self::build_search_string($post_id);
-    if ($search === '') return null;
+  private static function find_fulltext_candidates($meta, $search_text, $meta_key, $assigned_ids, $limit) {
+    global $wpdb;
+    $safe_table = esc_sql($meta['table']);
+    $id_col = preg_replace('/[^a-zA-Z0-9_]/', '', $meta['id_col']);
+    $cols = array_filter(array_map(function($c){ return preg_replace('/[^a-zA-Z0-9_]/', '', $c); }, $meta['text_cols']));
+    if (!$safe_table || !$id_col || empty($cols)) return [];
 
-    if ($kind === 'video') {
-      $table = self::table('tmwseo_titles');
-      $columns = ['focus_keyword', 'seo_title', 'tone', 'category', 'source_longtail'];
-      $id_col = 'video_id';
-    } elseif ($source === 'video') {
-      $table = self::table('tmwseo_video_h2');
-      $columns = ['h2_1', 'h2_2', 'h2_3', 'h2_4'];
-      $id_col = 'page_id';
-    } elseif ($source === 'model_trait') {
-      $table = self::table('tmwseo_model_h2');
-      $columns = ['trait', 'h2_1', 'h2_2', 'h2_3', 'h2_4'];
-      $id_col = 'page_id';
-    } elseif ($source === 'model_nt') {
-      $table = self::table('tmwseo_model_h2_nt');
-      $columns = ['h2_1', 'h2_2', 'h2_3', 'h2_4'];
-      $id_col = 'page_id';
-    } else {
-      return null;
+    $match_cols = implode(',', array_map(function($c){ return "`$c`"; }, $cols));
+    $select_cols = implode(',', array_map(function($c){ return "t.`$c`"; }, $cols));
+
+    $where = ["MATCH($match_cols) AGAINST (%s IN NATURAL LANGUAGE MODE) > 0"];
+    $params = [$search_text];
+    $joins = [];
+    if ($meta_key) {
+      $joins[] = $wpdb->prepare("LEFT JOIN {$wpdb->postmeta} pm ON pm.meta_key = %s AND pm.meta_value = t.`$id_col`", $meta_key);
+      $where[] = "pm.meta_id IS NULL";
+    }
+    if (!empty($assigned_ids)) {
+      $placeholders = implode(',', array_fill(0, count($assigned_ids), '%s'));
+      $where[] = "t.`$id_col` NOT IN ($placeholders)";
+      $params = array_merge($params, $assigned_ids);
     }
 
-    $match = self::find_best_fulltext_match($table, $id_col, $columns, $search, $meta_key);
-    if (!$match || empty($match['id'])) {
-      return null;
+    $limit = max(1, intval($limit));
+    $sql = "
+      SELECT t.`$id_col` AS mapped_id, {$select_cols},
+             MATCH($match_cols) AGAINST (%s IN NATURAL LANGUAGE MODE) AS ft_score
+      FROM `{$safe_table}` t
+      " . implode(' ', $joins) . "
+      WHERE " . implode(' AND ', $where) . "
+      ORDER BY ft_score DESC
+      LIMIT %d
+    ";
+    $params = array_merge([$search_text], $params, [$limit]);
+    $prepared = $wpdb->prepare($sql, $params);
+    $rows = $wpdb->get_results($prepared, ARRAY_A);
+    if ($rows === null) {
+      self::log('[TMW-FT] FULLTEXT query failed on ' . $meta['table'] . ': ' . ($wpdb->last_error ?: 'unknown error'));
+      return [];
     }
 
-    update_post_meta($post_id, $meta_key, $match['id']);
-    self::log(sprintf('[TMW-MAP] Smart-mapped post %d → %s (score=%.2f)', $post_id, $match['id'], $match['score']));
-
-    return $match;
+    $out = [];
+    foreach ($rows as $row) {
+      $text = self::build_candidate_text($row, $cols);
+      $out[] = [
+        'id' => self::clean_id($row['mapped_id'] ?? ''),
+        'text' => $text,
+        'row' => $row,
+        'ft_score' => isset($row['ft_score']) ? floatval($row['ft_score']) : 0,
+      ];
+    }
+    return $out;
   }
 
-  private static function find_best_fulltext_match($table, $id_col, $columns, $search, $meta_key) {
+  private static function find_php_candidates($meta, $tokens, $meta_key, $assigned_ids, $limit) {
     global $wpdb;
-    if (!$table || empty($columns) || !$search || !$meta_key) return null;
+    $safe_table = esc_sql($meta['table']);
+    $id_col = preg_replace('/[^a-zA-Z0-9_]/', '', $meta['id_col']);
+    $cols = array_filter(array_map(function($c){ return preg_replace('/[^a-zA-Z0-9_]/', '', $c); }, $meta['text_cols']));
+    if (!$safe_table || !$id_col || empty($cols)) return [];
 
-    $safe_cols = array_map(function($c) {
-      return preg_replace('/[^a-zA-Z0-9_]/', '', $c);
-    }, $columns);
-    $safe_cols = array_filter($safe_cols);
-    if (empty($safe_cols)) return null;
+    $select_cols = implode(',', array_map(function($c){ return "t.`$c`"; }, $cols));
+    $joins = [];
+    $where = [];
+    $params = [];
 
-    $match_cols = implode(',', array_map(function($c){ return "`$c`"; }, $safe_cols));
-    $id_col = preg_replace('/[^a-zA-Z0-9_]/', '', $id_col);
-    if ($id_col === '') return null;
+    if ($meta_key) {
+      $joins[] = $wpdb->prepare("LEFT JOIN {$wpdb->postmeta} pm ON pm.meta_key = %s AND pm.meta_value = t.`$id_col`", $meta_key);
+      $where[] = "pm.meta_id IS NULL";
+    }
 
-    $sql = $wpdb->prepare(
-      "SELECT t.`$id_col` AS mapped_id, MATCH($match_cols) AGAINST (%s IN NATURAL LANGUAGE MODE) AS score
-       FROM {$table} t
-       LEFT JOIN {$wpdb->postmeta} pm ON pm.meta_key = %s AND pm.meta_value = t.`$id_col`
-       WHERE MATCH($match_cols) AGAINST (%s IN NATURAL LANGUAGE MODE) > 0
-         AND pm.meta_id IS NULL
-       ORDER BY score DESC
-       LIMIT 1",
-      $search,
-      $meta_key,
-      $search
-    );
+    $token_subset = array_slice(array_filter($tokens, function($t){ return strlen($t) >= 3; }), 0, 4);
+    foreach ($token_subset as $tok) {
+      $like = '%' . $wpdb->esc_like($tok) . '%';
+      $bits = [];
+      foreach ($cols as $col) {
+        $bits[] = "t.`$col` LIKE %s";
+        $params[] = $like;
+      }
+      if (!empty($bits)) {
+        $where[] = '(' . implode(' OR ', $bits) . ')';
+      }
+    }
 
-    $row = $wpdb->get_row($sql, ARRAY_A);
-    if (!$row || !isset($row['mapped_id'])) return null;
+    if (!empty($assigned_ids)) {
+      $placeholders = implode(',', array_fill(0, count($assigned_ids), '%s'));
+      $where[] = "t.`$id_col` NOT IN ($placeholders)";
+      $params = array_merge($params, $assigned_ids);
+    }
 
-    return [
-      'id' => self::clean_id($row['mapped_id']),
-      'score' => isset($row['score']) ? floatval($row['score']) : 0.0,
+    $limit = max(5, intval($limit));
+    $sql = "
+      SELECT t.`$id_col` AS mapped_id, {$select_cols}
+      FROM `{$safe_table}` t
+      " . implode(' ', $joins) . "
+      " . (!empty($where) ? 'WHERE ' . implode(' AND ', $where) : '') . "
+      ORDER BY t.`$id_col` ASC
+      LIMIT %d
+    ";
+    $params[] = $limit;
+    $prepared = $wpdb->prepare($sql, $params);
+    $rows = $wpdb->get_results($prepared, ARRAY_A);
+    if ($rows === null) {
+      self::log('[TMW-MAP] Fallback candidate fetch failed on ' . $meta['table'] . ': ' . ($wpdb->last_error ?: 'unknown error'));
+      return [];
+    }
+
+    $out = [];
+    foreach ($rows as $row) {
+      $text = self::build_candidate_text($row, $cols);
+      $out[] = [
+        'id' => self::clean_id($row['mapped_id'] ?? ''),
+        'text' => $text,
+        'row' => $row,
+        'ft_score' => 0,
+      ];
+    }
+    return $out;
+  }
+
+  private static function score_candidates($candidates, $tokens, $search_text, $method) {
+    $scored = [];
+    foreach ($candidates as $cand) {
+      $score = self::score_candidate_text($tokens, $search_text, $cand['text']);
+      if (!empty($cand['ft_score']) && $method === 'fulltext') {
+        $score = min(1, $score + min(0.4, $cand['ft_score'] / 10));
+      }
+      $scored[] = array_merge($cand, ['score' => $score]);
+    }
+    usort($scored, function($a, $b) {
+      return ($a['score'] === $b['score']) ? 0 : (($a['score'] < $b['score']) ? 1 : -1);
+    });
+    return $scored;
+  }
+
+  private static function smart_map_csv_id($post_id, $kind, $source, $meta_key, $assign = true, $capture_candidates = false) {
+    if (!$meta_key) return null;
+    $settings = self::get_settings();
+    $threshold = isset($settings['smart_confidence']) ? max(0.0, min(1.0, floatval($settings['smart_confidence']))) : 0.35;
+
+    $context = self::build_search_context($post_id);
+    if ($context['search_text'] === '') {
+      return ['id' => '', 'score' => 0, 'search_text' => '', 'candidates' => [], 'used_fulltext' => false];
+    }
+
+    $meta = self::get_match_table_meta($kind, $source);
+    if (!$meta) return ['id' => '', 'score' => 0, 'search_text' => $context['search_text'], 'candidates' => [], 'used_fulltext' => false];
+
+    $assigned_ids = self::get_assigned_ids($meta_key);
+    $used_fulltext = false;
+    $candidates = [];
+
+    if (!empty($meta['index']) && self::is_fulltext_available($meta['table'], $meta['index'])) {
+      $candidates = self::find_fulltext_candidates($meta, $context['search_text'], $meta_key, $assigned_ids, 10);
+      $used_fulltext = true;
+    } else {
+      self::log('[TMW-FT] FULLTEXT unavailable on ' . $meta['table'] . ' — falling back to PHP scoring.');
+    }
+
+    if (empty($candidates)) {
+      $candidates = self::find_php_candidates($meta, $context['tokens'], $meta_key, $assigned_ids, 25);
+      $used_fulltext = false;
+    }
+
+    if (empty($candidates)) {
+      return ['id' => '', 'score' => 0, 'search_text' => $context['search_text'], 'candidates' => [], 'used_fulltext' => $used_fulltext];
+    }
+
+    $scored = self::score_candidates($candidates, $context['tokens'], $context['search_text'], $used_fulltext ? 'fulltext' : 'php');
+    $best = $scored[0] ?? null;
+    $result = [
+      'id' => ($best && $best['score'] >= $threshold) ? $best['id'] : '',
+      'score' => $best ? $best['score'] : 0,
+      'search_text' => $context['search_text'],
+      'candidates' => $capture_candidates ? array_slice($scored, 0, 5) : [],
+      'used_fulltext' => $used_fulltext,
+      'method' => $used_fulltext ? 'fulltext' : 'php',
     ];
+
+    if ($assign && $best && $best['id'] && $best['score'] >= $threshold) {
+      update_post_meta($post_id, $meta_key, $best['id']);
+      self::mark_assigned_id($meta_key, $best['id']);
+      self::log(sprintf('[TMW-MAP] Smart-mapped post %d → %s (score=%.2f, method=%s)', $post_id, $best['id'], $best['score'], $used_fulltext ? 'FULLTEXT' : 'PHP'));
+    } elseif ($assign) {
+      $top = array_slice($scored, 0, 5);
+      $summary = array_map(function($c){ return $c['id'] . ':' . number_format($c['score'], 2); }, $top);
+      self::log(sprintf('[TMW-MAP] Low confidence for post %d (best=%.2f, method=%s). Top: %s', $post_id, $best ? $best['score'] : 0, $used_fulltext ? 'FULLTEXT' : 'PHP', implode(', ', $summary)));
+    }
+
+    return $result;
   }
 
   private static function run_smart_backfill($target, $limit) {
@@ -1514,7 +1922,7 @@ class TMW_SEO_CSV_Autopilot {
         continue;
       }
 
-      $match = self::smart_map_csv_id($pid, $kind, $source, $meta_key);
+      $match = self::smart_map_csv_id($pid, $kind, $source, $meta_key, true, false);
       if ($match && !empty($match['id'])) {
         $mapped++;
         $scores[] = floatval($match['score']);
