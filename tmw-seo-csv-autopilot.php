@@ -23,6 +23,7 @@ class TMW_SEO_CSV_Autopilot {
     add_action('admin_post_tmwseo_csv_save_settings', [__CLASS__, 'handle_save_settings']);
     add_action('admin_post_tmwseo_csv_import', [__CLASS__, 'handle_import']);
     add_action('admin_post_tmwseo_csv_start_batch', [__CLASS__, 'handle_start_batch']);
+    add_action('admin_post_tmwseo_csv_run_now', [__CLASS__, 'handle_run_now']);
     add_action('admin_post_tmwseo_csv_reset_progress', [__CLASS__, 'handle_reset_progress']);
 
     add_action(self::CRON_HOOK, [__CLASS__, 'run_batch']);
@@ -283,6 +284,12 @@ class TMW_SEO_CSV_Autopilot {
     echo '<input type="hidden" name="action" value="tmwseo_csv_start_batch" />';
     wp_nonce_field('tmwseo_csv_start_batch');
     submit_button($running ? 'Kick Batch (still running)' : 'Start Batch Apply', 'primary', 'submit', false);
+    echo '</form>';
+
+    echo '<form method="post" action="'.esc_url(admin_url('admin-post.php')).'" style="display:inline-block;margin-right:10px;">';
+    echo '<input type="hidden" name="action" value="tmwseo_csv_run_now" />';
+    wp_nonce_field('tmwseo_csv_run_now');
+    submit_button('Run batch now (single tick)', 'secondary', 'submit', false);
     echo '</form>';
 
     echo '<form method="post" action="'.esc_url(admin_url('admin-post.php')).'" style="display:inline-block;">';
@@ -555,9 +562,21 @@ class TMW_SEO_CSV_Autopilot {
     exit;
   }
 
-  public static function run_batch() {
+  public static function handle_run_now() {
+    if (!current_user_can('manage_options')) wp_die('No permission');
+    check_admin_referer('tmwseo_csv_run_now');
+
+    self::log('[TMW-BATCH] Manual batch tick requested.');
+    self::run_batch(true);
+
+    wp_redirect(admin_url('admin.php?page=tmwseo-csv'));
+    exit;
+  }
+
+  public static function run_batch($forced = false) {
     $s = self::get_settings();
-    if (intval($s['progress']['running']) !== 1) return;
+    $is_running = intval($s['progress']['running']) === 1;
+    if (!$forced && !$is_running) return;
 
     $batch_size = max(10, min(1000, intval($s['batch_size'])));
     $did_work = false;
@@ -572,12 +591,16 @@ class TMW_SEO_CSV_Autopilot {
     $did_work = self::apply_h2_batch('model', $batch_size) || $did_work;
 
     if (!$did_work) {
-      // Stop if nothing left
-      $s = self::get_settings();
-      $s['progress']['running'] = 0;
-      self::save_settings($s);
-      wp_clear_scheduled_hook(self::CRON_HOOK);
-      self::log('Batch finished: nothing left to process. Stopped.');
+      if ($is_running && !$forced) {
+        // Stop if nothing left
+        $s = self::get_settings();
+        $s['progress']['running'] = 0;
+        self::save_settings($s);
+        wp_clear_scheduled_hook(self::CRON_HOOK);
+        self::log('[TMW-BATCH] Batch finished: nothing left to process. Stopped.');
+      } elseif ($forced) {
+        self::log('[TMW-BATCH] Manual batch tick completed (no work this pass).');
+      }
     }
   }
 
@@ -587,45 +610,7 @@ class TMW_SEO_CSV_Autopilot {
     if (empty($post_types)) return false;
 
     $last_id = intval($s['progress']['titles_last_id']);
-    $q = new WP_Query([
-      'post_type' => $post_types,
-      'post_status' => 'publish',
-      'posts_per_page' => $batch_size,
-      'orderby' => 'ID',
-      'order' => 'ASC',
-      'fields' => 'ids',
-      'paged' => 1,
-      'ignore_sticky_posts' => true,
-      'meta_query' => [],
-      'date_query' => [],
-      'post__not_in' => [],
-      'post_parent' => null,
-      'suppress_filters' => true,
-      'no_found_rows' => true,
-      'cache_results' => false,
-      'update_post_meta_cache' => false,
-      'update_post_term_cache' => false,
-      'post__in' => [],
-      'post_name__in' => [],
-      'post_mime_type' => '',
-      'perm' => '',
-      'has_password' => null,
-      'author' => '',
-      'author_name' => '',
-      'cat' => '',
-      'tag' => '',
-      'p' => 0,
-      'post__not_in' => [],
-      'post__in' => [],
-      'meta_key' => '',
-      'meta_value' => '',
-      'meta_compare' => '',
-      'meta_type' => '',
-      'tax_query' => [],
-      'ID__gt' => $last_id
-    ]);
-
-    $ids = $q->posts;
+    $ids = self::fetch_post_ids($post_types, $last_id, $batch_size);
     if (empty($ids)) return false;
 
     $max_id = $last_id;
@@ -634,10 +619,16 @@ class TMW_SEO_CSV_Autopilot {
     foreach ($ids as $post_id) {
       $max_id = max($max_id, intval($post_id));
       $video_id = self::resolve_id_for_post($post_id, 'video');
-      if (!$video_id) continue;
+      if (!$video_id) {
+        self::log("[TMW-BATCH] Titles: missing video_id mapping for post $post_id");
+        continue;
+      }
 
       $rowset = self::get_titles_for_video($video_id);
-      if (!$rowset || empty($rowset['keyword_1'])) continue;
+      if (!$rowset || empty($rowset['keyword_1'])) {
+        self::log("[TMW-BATCH] Titles: no CSV rows for video_id {$video_id} (post {$post_id})");
+        continue;
+      }
 
       $primary = $rowset['keyword_1'];
       $seo_title = self::safe_out($primary['seo_title'], $s);
@@ -710,22 +701,7 @@ class TMW_SEO_CSV_Autopilot {
     if (empty($post_types)) return false;
 
     $last_id = intval($s['progress'][$progress_key]);
-
-    $q = new WP_Query([
-      'post_type' => $post_types,
-      'post_status' => 'publish',
-      'posts_per_page' => $batch_size,
-      'orderby' => 'ID',
-      'order' => 'ASC',
-      'fields' => 'ids',
-      'no_found_rows' => true,
-      'cache_results' => false,
-      'update_post_meta_cache' => false,
-      'update_post_term_cache' => false,
-      'ID__gt' => $last_id
-    ]);
-
-    $ids = $q->posts;
+    $ids = self::fetch_post_ids($post_types, $last_id, $batch_size);
     if (empty($ids)) return false;
 
     $max_id = $last_id;
@@ -735,10 +711,16 @@ class TMW_SEO_CSV_Autopilot {
       $max_id = max($max_id, intval($post_id));
 
       $page_id = self::resolve_id_for_post($post_id, 'page');
-      if (!$page_id) continue;
+      if (!$page_id) {
+        self::log("[TMW-BATCH] H2 {$mode}: missing page_id mapping for post $post_id");
+        continue;
+      }
 
       $h2 = self::get_h2_for_page($page_id, $source);
-      if (!$h2) continue;
+      if (!$h2) {
+        self::log("[TMW-BATCH] H2 {$mode}: no CSV rows for page_id {$page_id} (post {$post_id})");
+        continue;
+      }
 
       // Safety on each H2
       $h2s = [];
@@ -768,6 +750,25 @@ class TMW_SEO_CSV_Autopilot {
 
     self::log("Batch H2 ($mode) applied: $count_ok posts (last_id=$max_id)");
     return true;
+  }
+
+  private static function fetch_post_ids($post_types, $last_id, $limit) {
+    global $wpdb;
+    if (empty($post_types)) return [];
+
+    $post_types = array_filter(array_map('sanitize_key', $post_types));
+    if (empty($post_types)) return [];
+
+    $limit = max(1, intval($limit));
+    $placeholders = implode(',', array_fill(0, count($post_types), '%s'));
+    $sql = $wpdb->prepare(
+      "SELECT ID FROM {$wpdb->posts} WHERE post_status='publish' AND post_type IN ($placeholders) AND ID > %d ORDER BY ID ASC LIMIT %d",
+      array_merge($post_types, [$last_id, $limit])
+    );
+
+    $ids = $wpdb->get_col($sql);
+    if (!is_array($ids)) return [];
+    return array_map('intval', $ids);
   }
 
   /** -------------------------
