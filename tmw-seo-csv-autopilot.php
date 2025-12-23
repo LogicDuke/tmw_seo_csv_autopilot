@@ -1,10 +1,11 @@
 <?php
-/**
- * Plugin Name: TMW SEO CSV Autopilot (No OpenAI)
- * Description: CSV-first SEO autopilot for adult websites: imports Titles/H2 CSVs, applies RankMath title/description/focus keywords, injects H2 blocks, adds adult rating meta + VideoObject schema, runs in batches.
- * Version: 1.0.0
- * Author: TMW
- */
+/*
+Plugin Name: TMW SEO CSV Autopilot (No OpenAI)
+Description: CSV-first SEO autopilot for adult websites: imports Titles/H2 CSVs, applies RankMath meta, injects H2 blocks, adds adult meta + video schema, runs in batches.
+Version: 1.0.0
+Author: TMW
+*/
+
 
 if (!defined('ABSPATH')) { exit; }
 
