@@ -13,12 +13,14 @@ class TMW_SEO_CSV_Autopilot {
 
   const OPT_SETTINGS = 'tmwseo_csv_settings_v1';
   const OPT_LOGS     = 'tmwseo_csv_logs_v1';
+  const OPT_FT_READY = 'tmwseo_csv_ft_ready_v1';
   const CRON_HOOK    = 'tmwseo_csv_batch_cron_v1';
 
   public static function boot() {
     register_activation_hook(__FILE__, [__CLASS__, 'activate']);
     register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate']);
 
+    add_action('init', [__CLASS__, 'maybe_ensure_fulltext_indexes']);
     add_action('admin_menu', [__CLASS__, 'admin_menu']);
     add_action('admin_post_tmwseo_csv_save_settings', [__CLASS__, 'handle_save_settings']);
     add_action('admin_post_tmwseo_csv_import', [__CLASS__, 'handle_import']);
@@ -29,6 +31,7 @@ class TMW_SEO_CSV_Autopilot {
     add_action('admin_post_tmwseo_csv_backfill_model_ids', [__CLASS__, 'handle_backfill_model_ids']);
     add_action('admin_post_tmwseo_csv_backfill_video_page_ids', [__CLASS__, 'handle_backfill_video_page_ids']);
     add_action('admin_post_tmwseo_csv_backfill_video_ids', [__CLASS__, 'handle_backfill_video_ids']);
+    add_action('admin_post_tmwseo_csv_backfill_smart_map', [__CLASS__, 'handle_backfill_smart_map']);
 
     add_action(self::CRON_HOOK, [__CLASS__, 'run_batch']);
 
@@ -58,6 +61,55 @@ class TMW_SEO_CSV_Autopilot {
     self::log('Deactivated plugin and cleared cron hook.');
   }
 
+  public static function maybe_ensure_fulltext_indexes() {
+    $ready = get_option(self::OPT_FT_READY, '');
+    if ($ready === '1') return;
+    self::ensure_fulltext_indexes();
+  }
+
+  private static function ensure_fulltext_indexes() {
+    global $wpdb;
+    $tables = [
+      self::table('tmwseo_titles') => [
+        'name' => 'tmwseo_ft_titles',
+        'cols' => ['focus_keyword', 'seo_title', 'tone', 'category', 'source_longtail'],
+      ],
+      self::table('tmwseo_video_h2') => [
+        'name' => 'tmwseo_ft_video_h2',
+        'cols' => ['h2_1', 'h2_2', 'h2_3', 'h2_4'],
+      ],
+      self::table('tmwseo_model_h2') => [
+        'name' => 'tmwseo_ft_model_h2',
+        'cols' => ['trait', 'h2_1', 'h2_2', 'h2_3', 'h2_4'],
+      ],
+      self::table('tmwseo_model_h2_nt') => [
+        'name' => 'tmwseo_ft_model_h2_nt',
+        'cols' => ['h2_1', 'h2_2', 'h2_3', 'h2_4'],
+      ],
+    ];
+
+    foreach ($tables as $table => $meta) {
+      $exists = $wpdb->get_var($wpdb->prepare(
+        "SELECT COUNT(1) FROM INFORMATION_SCHEMA.STATISTICS WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s",
+        $table,
+        $meta['name']
+      ));
+
+      if (intval($exists) > 0) continue;
+
+      $cols = implode(',', array_map(function($c){ return "`$c`"; }, $meta['cols']));
+      $sql = "ALTER TABLE {$table} ADD FULLTEXT {$meta['name']} ({$cols})";
+      $res = $wpdb->query($sql);
+      if ($res === false) {
+        self::log('[TMW-MAP] Failed to add FULLTEXT index on ' . $table);
+      } else {
+        self::log('[TMW-MAP] Added FULLTEXT index on ' . $table);
+      }
+    }
+
+    update_option(self::OPT_FT_READY, '1', false);
+  }
+
   private static function create_tables() {
     global $wpdb;
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
@@ -78,7 +130,8 @@ class TMW_SEO_CSV_Autopilot {
       category VARCHAR(64) NULL,
       source_longtail VARCHAR(255) NULL,
       PRIMARY KEY (video_id, keyword_slot),
-      KEY video_id (video_id)
+      KEY video_id (video_id),
+      FULLTEXT KEY ft_titles (focus_keyword, seo_title, tone, category, source_longtail)
     ) $charset;";
 
     $sql2 = "CREATE TABLE $t_vh2 (
@@ -87,7 +140,8 @@ class TMW_SEO_CSV_Autopilot {
       h2_2 VARCHAR(255) NOT NULL,
       h2_3 VARCHAR(255) NOT NULL,
       h2_4 VARCHAR(255) NOT NULL,
-      PRIMARY KEY (page_id)
+      PRIMARY KEY (page_id),
+      FULLTEXT KEY ft_video_h2 (h2_1, h2_2, h2_3, h2_4)
     ) $charset;";
 
     $sql3 = "CREATE TABLE $t_mh2 (
@@ -97,7 +151,8 @@ class TMW_SEO_CSV_Autopilot {
       h2_2 VARCHAR(255) NOT NULL,
       h2_3 VARCHAR(255) NOT NULL,
       h2_4 VARCHAR(255) NOT NULL,
-      PRIMARY KEY (page_id)
+      PRIMARY KEY (page_id),
+      FULLTEXT KEY ft_model_h2 (trait, h2_1, h2_2, h2_3, h2_4)
     ) $charset;";
 
     $sql4 = "CREATE TABLE $t_mh2nt (
@@ -106,13 +161,16 @@ class TMW_SEO_CSV_Autopilot {
       h2_2 VARCHAR(255) NOT NULL,
       h2_3 VARCHAR(255) NOT NULL,
       h2_4 VARCHAR(255) NOT NULL,
-      PRIMARY KEY (page_id)
+      PRIMARY KEY (page_id),
+      FULLTEXT KEY ft_model_h2_nt (h2_1, h2_2, h2_3, h2_4)
     ) $charset;";
 
     dbDelta($sql1);
     dbDelta($sql2);
     dbDelta($sql3);
     dbDelta($sql4);
+
+    self::ensure_fulltext_indexes();
   }
 
   private static function table($suffix) {
@@ -333,6 +391,28 @@ class TMW_SEO_CSV_Autopilot {
     submit_button('Backfill Video IDs (Titles)', 'secondary', 'submit', false);
     echo '</form>';
 
+    echo '<p style="margin-top:10px;"><strong>Smart backfill (Fulltext matching)</strong>: builds a search string from LiveJasmin title + taxonomy terms, then picks the best unused CSV row.</p>';
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="display:inline-block;margin-right:10px;">';
+    echo '<input type="hidden" name="action" value="tmwseo_csv_backfill_smart_map" />';
+    echo '<input type="hidden" name="smart_target" value="page_video" />';
+    wp_nonce_field('tmwseo_csv_backfill_smart_map');
+    submit_button('Smart backfill Video-page IDs', 'secondary', 'submit', false);
+    echo '</form>';
+
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="display:inline-block;margin-right:10px;">';
+    echo '<input type="hidden" name="action" value="tmwseo_csv_backfill_smart_map" />';
+    echo '<input type="hidden" name="smart_target" value="page_model" />';
+    wp_nonce_field('tmwseo_csv_backfill_smart_map');
+    submit_button('Smart backfill Model page IDs', 'secondary', 'submit', false);
+    echo '</form>';
+
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="display:inline-block;">';
+    echo '<input type="hidden" name="action" value="tmwseo_csv_backfill_smart_map" />';
+    echo '<input type="hidden" name="smart_target" value="video" />';
+    wp_nonce_field('tmwseo_csv_backfill_smart_map');
+    submit_button('Smart backfill Video IDs (Titles)', 'secondary', 'submit', false);
+    echo '</form>';
+
     // DIAGNOSTICS
     $model_h2_source = ($s['model_h2_source'] === 'trait') ? 'model_trait' : 'model_nt';
     $model_h2_table = self::get_model_h2_table_name($model_h2_source);
@@ -498,6 +578,30 @@ class TMW_SEO_CSV_Autopilot {
       count($posts)
     );
     self::log('[TMW-BATCH] ' . $msg);
+    return self::redirect_backfill($msg);
+  }
+
+  public static function handle_backfill_smart_map() {
+    if (!current_user_can('manage_options')) wp_die('No permission');
+    check_admin_referer('tmwseo_csv_backfill_smart_map');
+
+    $target = sanitize_text_field($_POST['smart_target'] ?? '');
+    $limit = 50;
+    $result = self::run_smart_backfill($target, $limit);
+
+    if (isset($result['error'])) {
+      return self::redirect_backfill($result['error']);
+    }
+
+    $msg = sprintf(
+      'Smart backfill %s: mapped %d, skipped %d, best score %.2f, avg score %.2f.',
+      $target,
+      intval($result['mapped']),
+      intval($result['skipped']),
+      $result['best_score'],
+      $result['avg_score']
+    );
+    self::log('[TMW-MAP] ' . $msg);
     return self::redirect_backfill($msg);
   }
 
@@ -817,7 +921,7 @@ class TMW_SEO_CSV_Autopilot {
 
     foreach ($ids as $post_id) {
       $max_id = max($max_id, intval($post_id));
-      $video_id = self::resolve_id_for_post($post_id, 'video');
+      $video_id = self::resolve_id_for_post($post_id, 'video', 'titles');
       if (!$video_id) {
         self::log("[TMW-BATCH] Titles: missing video_id mapping for post $post_id");
         continue;
@@ -909,7 +1013,7 @@ class TMW_SEO_CSV_Autopilot {
     foreach ($ids as $post_id) {
       $max_id = max($max_id, intval($post_id));
 
-      $page_id = self::resolve_id_for_post($post_id, 'page');
+      $page_id = self::resolve_id_for_post($post_id, 'page', $source);
       if (!$page_id) {
         self::log("[TMW-BATCH] H2 {$mode}: missing page_id mapping for post $post_id");
         continue;
@@ -1102,28 +1206,9 @@ class TMW_SEO_CSV_Autopilot {
     return array_values(array_unique($parts));
   }
 
-  /** -------------------------
-   * ID resolution
-   * ------------------------ */
-  private static function resolve_id_for_post($post_id, $kind) {
-    $s = self::get_settings();
-    $mode = $s['mapping_mode'];
+  private static function normalize_id_for_kind($id, $kind) {
+    $id = strtolower(trim((string)$id));
 
-    $slug = get_post_field('post_name', $post_id);
-
-    $meta_key = ($kind === 'video') ? $s['video_id_meta_key'] : $s['page_id_meta_key'];
-    $meta_val = $meta_key ? get_post_meta($post_id, $meta_key, true) : '';
-
-    $id = '';
-    if ($mode === 'meta' && !empty($meta_val)) {
-      $id = (string)$meta_val;
-    } else {
-      $id = (string)$slug;
-    }
-
-    $id = strtolower(trim($id));
-
-    // Normalize numeric-only slugs/meta (optional)
     if (preg_match('/^\d+$/', $id)) {
       $n = intval($id);
       if ($kind === 'video') $id = sprintf('video_%04d', $n);
@@ -1133,10 +1218,63 @@ class TMW_SEO_CSV_Autopilot {
     return self::clean_id($id);
   }
 
+  /** -------------------------
+   * ID resolution
+   * ------------------------ */
+  private static function resolve_id_for_post($post_id, $kind, $source = '') {
+    $s = self::get_settings();
+    $mode = $s['mapping_mode'];
+
+    $slug = get_post_field('post_name', $post_id);
+
+    $meta_key = ($kind === 'video') ? $s['video_id_meta_key'] : $s['page_id_meta_key'];
+    $meta_val = $meta_key ? get_post_meta($post_id, $meta_key, true) : '';
+
+    $candidate = self::normalize_id_for_kind($meta_val, $kind);
+    if ($mode !== 'slug' && $candidate && self::csv_row_exists($candidate, $kind, $source)) {
+      return $candidate;
+    }
+
+    if ($mode === 'meta') {
+      $mapped = self::smart_map_csv_id($post_id, $kind, $source, $meta_key);
+      if ($mapped && !empty($mapped['id'])) {
+        return $mapped['id'];
+      }
+    }
+
+    $id = ($mode === 'slug') ? $slug : $candidate;
+    $id = $id ? $id : $slug;
+
+    $id = self::normalize_id_for_kind($id, $kind);
+    if ($id && self::csv_row_exists($id, $kind, $source)) {
+      return $id;
+    }
+
+    return '';
+  }
+
   private static function get_model_h2_table_name($source) {
     if ($source === 'model_trait') return self::table('tmwseo_model_h2');
     if ($source === 'model_nt') return self::table('tmwseo_model_h2_nt');
     return '';
+  }
+
+  private static function csv_row_exists($id, $kind, $source) {
+    if (!$id) return false;
+    if ($kind === 'video') {
+      $rows = self::get_titles_for_video($id);
+      return !empty($rows);
+    }
+
+    if ($source === 'video') {
+      return !empty(self::get_h2_for_page($id, 'video'));
+    }
+
+    if ($source === 'model_trait' || $source === 'model_nt') {
+      return !empty(self::get_h2_for_page($id, $source));
+    }
+
+    return false;
   }
 
   private static function get_model_h2_samples($source) {
@@ -1174,7 +1312,7 @@ class TMW_SEO_CSV_Autopilot {
 
     $rows = [];
     foreach ($posts as $pid) {
-      $page_id = self::resolve_id_for_post($pid, 'page');
+      $page_id = self::resolve_id_for_post($pid, 'page', $source);
       $rows[] = [
         'post_id' => intval($pid),
         'post_name' => (string)get_post_field('post_name', $pid),
@@ -1194,7 +1332,7 @@ class TMW_SEO_CSV_Autopilot {
       return ['error' => 'Invalid lookup nonce. Please try again.'];
     }
 
-    $page_id = self::resolve_id_for_post($post_id, 'page');
+    $page_id = self::resolve_id_for_post($post_id, 'page', $source);
     $has_csv = self::model_h2_row_exists($page_id, $source);
 
     return [
@@ -1220,6 +1358,178 @@ class TMW_SEO_CSV_Autopilot {
     }
 
     return ['assigned' => $assigned];
+  }
+
+  private static function build_search_string($post_id) {
+    $title = '';
+    $candidates = [
+      '_tmw_livejasmin_title',
+      '_livejasmin_title',
+      'livejasmin_title',
+    ];
+    foreach ($candidates as $key) {
+      $maybe = get_post_meta($post_id, $key, true);
+      if (!empty($maybe)) {
+        $title = (string)$maybe;
+        break;
+      }
+    }
+    if ($title === '') {
+      $title = get_post_field('post_title', $post_id);
+    }
+
+    $title = wp_strip_all_tags((string)$title);
+
+    $taxes = get_object_taxonomies(get_post_type($post_id));
+    $names = [];
+    foreach ($taxes as $tax) {
+      $terms = get_the_terms($post_id, $tax);
+      if (!is_array($terms)) continue;
+      foreach ($terms as $t) {
+        $names[] = $t->name;
+      }
+    }
+
+    $parts = array_filter(array_map('trim', array_merge([$title], $names)));
+    $parts = array_values(array_unique($parts));
+    return implode(' ', $parts);
+  }
+
+  private static function smart_map_csv_id($post_id, $kind, $source, $meta_key) {
+    if (!$meta_key) return null;
+    $search = self::build_search_string($post_id);
+    if ($search === '') return null;
+
+    if ($kind === 'video') {
+      $table = self::table('tmwseo_titles');
+      $columns = ['focus_keyword', 'seo_title', 'tone', 'category', 'source_longtail'];
+      $id_col = 'video_id';
+    } elseif ($source === 'video') {
+      $table = self::table('tmwseo_video_h2');
+      $columns = ['h2_1', 'h2_2', 'h2_3', 'h2_4'];
+      $id_col = 'page_id';
+    } elseif ($source === 'model_trait') {
+      $table = self::table('tmwseo_model_h2');
+      $columns = ['trait', 'h2_1', 'h2_2', 'h2_3', 'h2_4'];
+      $id_col = 'page_id';
+    } elseif ($source === 'model_nt') {
+      $table = self::table('tmwseo_model_h2_nt');
+      $columns = ['h2_1', 'h2_2', 'h2_3', 'h2_4'];
+      $id_col = 'page_id';
+    } else {
+      return null;
+    }
+
+    $match = self::find_best_fulltext_match($table, $id_col, $columns, $search, $meta_key);
+    if (!$match || empty($match['id'])) {
+      return null;
+    }
+
+    update_post_meta($post_id, $meta_key, $match['id']);
+    self::log(sprintf('[TMW-MAP] Smart-mapped post %d → %s (score=%.2f)', $post_id, $match['id'], $match['score']));
+
+    return $match;
+  }
+
+  private static function find_best_fulltext_match($table, $id_col, $columns, $search, $meta_key) {
+    global $wpdb;
+    if (!$table || empty($columns) || !$search || !$meta_key) return null;
+
+    $safe_cols = array_map(function($c) {
+      return preg_replace('/[^a-zA-Z0-9_]/', '', $c);
+    }, $columns);
+    $safe_cols = array_filter($safe_cols);
+    if (empty($safe_cols)) return null;
+
+    $match_cols = implode(',', array_map(function($c){ return "`$c`"; }, $safe_cols));
+    $id_col = preg_replace('/[^a-zA-Z0-9_]/', '', $id_col);
+    if ($id_col === '') return null;
+
+    $sql = $wpdb->prepare(
+      "SELECT t.`$id_col` AS mapped_id, MATCH($match_cols) AGAINST (%s IN NATURAL LANGUAGE MODE) AS score
+       FROM {$table} t
+       LEFT JOIN {$wpdb->postmeta} pm ON pm.meta_key = %s AND pm.meta_value = t.`$id_col`
+       WHERE MATCH($match_cols) AGAINST (%s IN NATURAL LANGUAGE MODE) > 0
+         AND pm.meta_id IS NULL
+       ORDER BY score DESC
+       LIMIT 1",
+      $search,
+      $meta_key,
+      $search
+    );
+
+    $row = $wpdb->get_row($sql, ARRAY_A);
+    if (!$row || !isset($row['mapped_id'])) return null;
+
+    return [
+      'id' => self::clean_id($row['mapped_id']),
+      'score' => isset($row['score']) ? floatval($row['score']) : 0.0,
+    ];
+  }
+
+  private static function run_smart_backfill($target, $limit) {
+    $s = self::get_settings();
+    $limit = max(5, min(200, intval($limit)));
+
+    if ($target === 'video') {
+      $post_types = self::csv_list($s['titles_post_types']);
+      $kind = 'video';
+      $source = 'titles';
+      $meta_key = $s['video_id_meta_key'];
+    } elseif ($target === 'page_video') {
+      $post_types = self::csv_list($s['video_h2_post_types']);
+      $kind = 'page';
+      $source = 'video';
+      $meta_key = $s['page_id_meta_key'];
+    } elseif ($target === 'page_model') {
+      $post_types = self::csv_list($s['model_post_types']);
+      $kind = 'page';
+      $source = ($s['model_h2_source'] === 'trait') ? 'model_trait' : 'model_nt';
+      $meta_key = $s['page_id_meta_key'];
+    } else {
+      return ['error' => 'Unknown smart backfill target.'];
+    }
+
+    if (empty($post_types) || !$meta_key) {
+      return ['error' => 'Smart backfill skipped: missing post types or meta key.'];
+    }
+
+    $posts = get_posts([
+      'post_type' => $post_types,
+      'post_status' => 'publish',
+      'posts_per_page' => $limit,
+      'orderby' => 'ID',
+      'order' => 'ASC',
+      'fields' => 'ids',
+      'suppress_filters' => true,
+      'no_found_rows' => true,
+    ]);
+
+    $mapped = 0;
+    $scores = [];
+    foreach ($posts as $pid) {
+      $meta_val = get_post_meta($pid, $meta_key, true);
+      $has_valid = $meta_val && self::csv_row_exists(self::normalize_id_for_kind($meta_val, $kind), $kind, $source);
+      if ($has_valid) {
+        continue;
+      }
+
+      $match = self::smart_map_csv_id($pid, $kind, $source, $meta_key);
+      if ($match && !empty($match['id'])) {
+        $mapped++;
+        $scores[] = floatval($match['score']);
+      }
+    }
+
+    $best = empty($scores) ? 0 : max($scores);
+    $avg = empty($scores) ? 0 : array_sum($scores) / count($scores);
+
+    return [
+      'mapped' => $mapped,
+      'skipped' => count($posts) - $mapped,
+      'best_score' => round($best, 2),
+      'avg_score' => round($avg, 2),
+    ];
   }
 
   /** -------------------------
